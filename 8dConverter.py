@@ -2,40 +2,37 @@ import os
 import sys
 from pydub import AudioSegment
 import numpy as np
-from scipy.signal import butter, lfilter
+from scipy.signal import butter, lfilter, lfilter_zi
 
-pan_range = (0.2, 0.8)
+# === Configurable Parameters ===
+pan_range = (0.18, 0.85)         # How far left/right it pans
+rotation_speed = 0.25            # Rotations per second
+max_front_gain = 0.2            # Max volume increase at 0°
+max_lowpass_cutoff_reduction = 100  # Max Hz reduced from back low-pass
+
 output_format = 'mp3'
 output_bitrate = '256k'
 output_codec = 'mp3'
-rotation_speed = 0.05  # Rotations per second
 
-
-def butter_lowpass_filter(data, cutoff, fs, order=6):
+# === Audio Processing Functions ===
+def butter_lowpass(cutoff, fs, order=4):
     nyq = 0.5 * fs
     normal_cutoff = cutoff / nyq
-    b, a = butter(order, normal_cutoff, btype='low', analog=False) # type: ignore
-    y = lfilter(b, a, data)
-    return y
+    return butter(order, normal_cutoff, btype='low', analog=False)
 
+def directional_weight(angle_deg, active_start, active_end):
+    angle = angle_deg % 360
+    if active_start < active_end:
+        if not (active_start <= angle <= active_end):
+            return 0
+        t = (angle - active_start) / (active_end - active_start)
+    else:
+        if not (angle >= active_start or angle <= active_end):
+            return 0
+        t = (angle - active_start) % 360 / ((active_end - active_start) % 360)
+    return np.sin(np.pi * t) ** 2  # smooth bell curve
 
-def apply_8d_effect(filename, out_audio_path, temp_dir):
-    base_dir = ''
-    if os.path.basename(os.path.dirname(temp_dir)):
-        base_dir = os.path.basename(os.path.dirname(temp_dir))+'\\'
-    ext = os.path.splitext(filename)[1][1:]
-    
-    if ext != 'mp3':
-        # Convert to mp3
-        audio = AudioSegment.from_file(base_dir+filename, format=ext)
-        
-        ext = 'wav'
-        # Get the new file path by changing the extension to .mp3
-        filename = temp_dir+'\\'+os.path.splitext(filename)[0] + f'.{ext}'
-        out_audio_path = os.path.splitext(out_audio_path)[0] + f'.{ext}'
-        
-        # Export the final audio
-        audio.export(filename, format=ext, bitrate="320k", parameters=["-sample_fmt", "s16"])
+def apply_8d_effect(filename, out_audio_path):
     audio = AudioSegment.from_file(filename)
     audio = audio.set_sample_width(4)
 
@@ -45,7 +42,7 @@ def apply_8d_effect(filename, out_audio_path, temp_dir):
     left, right = audio.split_to_mono()
     left_np = np.array(left.get_array_of_samples())
     right_np = np.array(right.get_array_of_samples())
-    
+
     chunk_samples = int(audio.frame_rate * 0.02)
     total_samples = len(left_np)
     num_chunks = total_samples // chunk_samples
@@ -53,7 +50,10 @@ def apply_8d_effect(filename, out_audio_path, temp_dir):
     left_chunks = []
     right_chunks = []
 
-    max_delay_samples = int(audio.frame_rate * 0.0007)  # ~0.7ms ITD
+    # Setup for persistent filter state
+    b, a = butter_lowpass(12000, audio.frame_rate, order=4) # type: ignore
+    zi_l = lfilter_zi(b, a) * 0
+    zi_r = lfilter_zi(b, a) * 0
 
     for i in range(num_chunks):
         start = i * chunk_samples
@@ -62,80 +62,71 @@ def apply_8d_effect(filename, out_audio_path, temp_dir):
         chunk_l = left_np[start:end].astype(np.float32)
         chunk_r = right_np[start:end].astype(np.float32)
 
+        # === ROTATION ANGLE ===
         t = i * 0.02
-        angle = 2 * np.pi * rotation_speed * t  # radians
+        angle_rad = 2 * np.pi * rotation_speed * t
+        angle_deg = (angle_rad * 180 / np.pi - 90) % 360  # ⬅️ ALIGN FRONT TO 0°
 
-        pan = 0.5 * (1 + np.cos(angle))
-        gain = 1.0 + 0.15 * np.cos(angle)
-        is_behind = np.cos(angle + np.pi) > 0.5
+        # === PANNING ===
+        pan = pan_range[0] + (pan_range[1] - pan_range[0]) * 0.5 * (1 + np.cos(angle_rad))
 
-        itd = int(max_delay_samples * np.sin(angle))
+        # === GAIN / FILTER INTENSITY ===
+        front_gain = directional_weight(angle_deg, 270, 90)       # peaks at 0°
+        back_lowpass = directional_weight(angle_deg, 90, 270)     # peaks at 180°
 
-        if is_behind:
-            chunk_l = butter_lowpass_filter(chunk_l, 3000, audio.frame_rate)
-            chunk_r = butter_lowpass_filter(chunk_r, 3000, audio.frame_rate)
+        gain = 1.0 + front_gain * max_front_gain
+        cutoff = 20000 - back_lowpass * max_lowpass_cutoff_reduction
 
+        # Apply smooth low-pass
+        if back_lowpass > 0.001:
+            b, a = butter_lowpass(cutoff, audio.frame_rate, order=4) # type: ignore
+            chunk_l, zi_l = lfilter(b, a, chunk_l, zi=zi_l)
+            chunk_r, zi_r = lfilter(b, a, chunk_r, zi=zi_r)
+
+        # === APPLY GAIN + PAN ===
         chunk_l *= (1 - pan) * gain
         chunk_r *= pan * gain
-
-        chunk_l = np.roll(chunk_l, -itd)
-        chunk_r = np.roll(chunk_r, itd)
 
         left_chunks.append(chunk_l)
         right_chunks.append(chunk_r)
 
+    # === Final Assembly ===
     left_final = np.clip(np.concatenate(left_chunks), -2147483648, 2147483647).astype(np.int32)
     right_final = np.clip(np.concatenate(right_chunks), -2147483648, 2147483647).astype(np.int32)
 
     left_seg = AudioSegment(
-        left_final.tobytes(),
-        frame_rate=audio.frame_rate,
-        sample_width=audio.sample_width,
-        channels=1
+        left_final.tobytes(), frame_rate=audio.frame_rate, sample_width=audio.sample_width, channels=1
     )
     right_seg = AudioSegment(
-        right_final.tobytes(),
-        frame_rate=audio.frame_rate,
-        sample_width=audio.sample_width,
-        channels=1
+        right_final.tobytes(), frame_rate=audio.frame_rate, sample_width=audio.sample_width, channels=1
     )
 
     final = AudioSegment.from_mono_audiosegments(left_seg, right_seg)
     final.export(out_audio_path, bitrate=output_bitrate, format=output_codec)
 
-
-def calculate_bitrate_from_samples(channels, bit_depth, sample_rate):
-    return (channels * bit_depth * sample_rate) / 1000
-
-
-def process_file(input_path, outpath, temp_dir):
+# === Batch Logic ===
+def process_file(input_path, outpath):
     os.makedirs(outpath, exist_ok=True)
-    os.makedirs(temp_dir, exist_ok=True)
     filename = os.path.basename(input_path)
     out_audio_path = os.path.join(outpath, os.path.splitext(filename)[0] + '.' + output_format)
-    apply_8d_effect(input_path, out_audio_path, temp_dir)
+    apply_8d_effect(input_path, out_audio_path)
 
-def process_files_in_folder(folder_path, outpath, temp_dir):
-    """Process all files in a folder."""
-    temp_dir = os.path.join(os.path.basename(folder_path), temp_dir)
+def process_files_in_folder(folder_path, outpath):  
     outpath = os.path.join(os.path.basename(folder_path), outpath)
-    os.makedirs(temp_dir, exist_ok=True)
     os.makedirs(outpath, exist_ok=True)
-
     for filename in os.listdir(folder_path):
-        if '.' in filename and (filename.endswith(".mp3") or filename.endswith(".webm") or filename.endswith(".wav") or filename.endswith(".flac")):
-            process_file(filename, outpath, temp_dir)
+        if filename.endswith((".mp3", ".webm", ".wav", ".flac")):
+            process_file(os.path.join(folder_path, filename), outpath)
 
 if __name__ == "__main__":
     outpath = 'out'
-    temp_dir = 'temp_audio'
     if len(sys.argv) > 1:
         for input_path in sys.argv[1:]:
             if os.path.isdir(input_path):
                 print(f"Processing folder: {input_path}")
-                process_files_in_folder(input_path, outpath, temp_dir)
-            elif os.path.isfile(input_path) and (input_path.endswith(".mp3") or input_path.endswith(".webm") or input_path.endswith(".wav") or input_path.endswith(".flac")):
+                process_files_in_folder(input_path, outpath)
+            elif os.path.isfile(input_path):
                 print(f"Processing file: {input_path}")
-                process_file(input_path, outpath, temp_dir)
+                process_file(input_path, outpath)
             else:
-                print(f"Invalid: {input_path}. Please provide a valid file or folder.")
+                print(f"Invalid: {input_path}")
