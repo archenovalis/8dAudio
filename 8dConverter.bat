@@ -1,3 +1,3 @@
 @echo off
-python 8dConverter.py %1
+py 8dConverter.py %1
 pause

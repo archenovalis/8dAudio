@@ -3,9 +3,11 @@
 Converts audio into 8d using paning, gain, and low-pass to create a circling effect.
 Brainflossing is wonderful.
 
-## External Requirements
+## Requirements
 
-ffmpeg.exe and ffprobe.exe can be found in the bin folder of [ffmpeg-master-latest-win64-gpl-shared.zip](https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip)
+1. Install [python via pymanager](https://www.python.org/downloads/windows/)
+2. py -m pip install pydub numpy audioop-lts
+3. ffmpeg.exe and ffprobe.exe can be found in the bin folder of [ffmpeg-master-latest-win64-gpl-shared.zip](https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip)
 
 ## Instructions
 

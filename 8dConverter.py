@@ -2,23 +2,15 @@ import os
 import sys
 from pydub import AudioSegment
 import numpy as np
-from scipy.signal import butter, lfilter, lfilter_zi
 
 # === Configurable Parameters ===
 pan_range = (0.18, 0.85)         # How far left/right it pans
 rotation_speed = 0.25            # Rotations per second
-max_front_gain = 0.2            # Max volume increase at 0°
-max_lowpass_cutoff_reduction = 100  # Max Hz reduced from back low-pass
+gain_range = (0.05, -0.15)         # Front and rear gain
 
 output_format = 'mp3'
 output_bitrate = '256k'
 output_codec = 'mp3'
-
-# === Audio Processing Functions ===
-def butter_lowpass(cutoff, fs, order=4):
-    nyq = 0.5 * fs
-    normal_cutoff = cutoff / nyq
-    return butter(order, normal_cutoff, btype='low', analog=False)
 
 def directional_weight(angle_deg, active_start, active_end):
     angle = angle_deg % 360
@@ -50,11 +42,6 @@ def apply_8d_effect(filename, out_audio_path):
     left_chunks = []
     right_chunks = []
 
-    # Setup for persistent filter state
-    b, a = butter_lowpass(12000, audio.frame_rate, order=4) # type: ignore
-    zi_l = lfilter_zi(b, a) * 0
-    zi_r = lfilter_zi(b, a) * 0
-
     for i in range(num_chunks):
         start = i * chunk_samples
         end = start + chunk_samples
@@ -70,18 +57,10 @@ def apply_8d_effect(filename, out_audio_path):
         # === PANNING ===
         pan = pan_range[0] + (pan_range[1] - pan_range[0]) * 0.5 * (1 + np.cos(angle_rad))
 
-        # === GAIN / FILTER INTENSITY ===
-        front_gain = directional_weight(angle_deg, 270, 90)       # peaks at 0°
-        back_lowpass = directional_weight(angle_deg, 90, 270)     # peaks at 180°
-
-        gain = 1.0 + front_gain * max_front_gain
-        cutoff = 20000 - back_lowpass * max_lowpass_cutoff_reduction
-
-        # Apply smooth low-pass
-        if back_lowpass > 0.001:
-            b, a = butter_lowpass(cutoff, audio.frame_rate, order=4) # type: ignore
-            chunk_l, zi_l = lfilter(b, a, chunk_l, zi=zi_l)
-            chunk_r, zi_r = lfilter(b, a, chunk_r, zi=zi_r)
+        # === GAIN BASED ON FRONT-BACK POSITION ONLY ===
+        front_emphasis = directional_weight(angle_deg, 270, 90)  # Peaks at 0°, 0 at 90°/270°
+        angle_gain = gain_range[1] + (gain_range[0] - gain_range[1]) * front_emphasis
+        gain = 1.0 + angle_gain
 
         # === APPLY GAIN + PAN ===
         chunk_l *= (1 - pan) * gain
